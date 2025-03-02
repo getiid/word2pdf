@@ -5,7 +5,7 @@ import subprocess
 import time
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QHBoxLayout, QPushButton, QLabel, QFileDialog,
-                            QProgressBar, QMessageBox)
+                            QProgressBar, QMessageBox, QCheckBox)
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 from PyQt6.QtGui import QIcon, QColor, QPalette, QFont
 
@@ -14,6 +14,8 @@ class ConvertThread(QThread):
     current_file = pyqtSignal(str)
     finished = pyqtSignal()
     error = pyqtSignal(str)
+    conflict_signal = pyqtSignal(str, str, bool)  # 新增信号，用于处理文件冲突，最后一个参数表示是否显示全局选项
+    conflict_response = None  # 用户对冲突的处理选择
     
     def __init__(self, input_folder, output_folder):
         super().__init__()
@@ -22,6 +24,8 @@ class ConvertThread(QThread):
         self.is_paused = False
         self.is_stopped = False
         self.word_app = None
+        self.conflict_response = None
+        self.global_conflict_choice = None  # 用户的全局冲突处理选择
 
     def pause(self):
         self.is_paused = True
@@ -36,6 +40,22 @@ class ConvertThread(QThread):
                 subprocess.run(['osascript', '-e', 'tell application "Microsoft Word" to quit'], check=True)
             except:
                 pass
+            finally:
+                self.word_app = None
+
+    def handle_conflict(self, filename, output_path, show_global_option=True):
+        if self.global_conflict_choice:
+            return self.global_conflict_choice
+
+        self.conflict_signal.emit(filename, output_path, show_global_option)
+        while self.conflict_response is None:
+            if self.is_stopped:
+                return None
+            time.sleep(0.1)
+
+        response = self.conflict_response
+        self.conflict_response = None
+        return response
 
     def run(self):
         try:
@@ -50,55 +70,76 @@ class ConvertThread(QThread):
             self.current_file.emit(f'已发现 {total_files} 个Word文件')
             converted_count = 0
             
-            # 启动Word并保持运行
-            init_script = '''
-            tell application "Microsoft Word"
-                launch
-                set bounds of window 1 to {100, 100, 600, 800}
-                set visible to true
-            end tell
-            '''
-            subprocess.run(['osascript', '-e', init_script], check=True)
-            self.word_app = True
-            
-            for i, filename in enumerate(files):
-                if self.is_stopped:
-                    self.error.emit('转换已停止')
-                    return
-                    
-                while self.is_paused:
-                    time.sleep(0.1)
+            try:
+                init_script = '''
+                tell application "Microsoft Word"
+                    launch
+                    set visible to false
+                    activate
+                    set the position of window 1 to {-1000, -1000}
+                end tell
+                '''
+                subprocess.run(['osascript', '-e', init_script], check=True)
+                self.word_app = True
+                
+                for i, filename in enumerate(files):
                     if self.is_stopped:
                         self.error.emit('转换已停止')
                         return
                         
-                try:
-                    input_path = os.path.join(self.input_folder, filename)
-                    output_path = os.path.join(self.output_folder, 
-                                             os.path.splitext(filename)[0] + '.pdf')
-                    
-                    applescript = f'''
-                    tell application "Microsoft Word"
-                        set bounds of window 1 to {100, 100, 600, 800}
-                        set visible to true
-                        open "{input_path}"
-                        set activeDoc to active document
-                        save as activeDoc file name "{output_path}" file format format PDF
-                        close activeDoc saving no
-                    end tell
-                    '''
-                    
-                    converted_count += 1
-                    self.current_file.emit(f'已发现 {total_files} 个Word文件，已成功转换 {converted_count} 个')
-                    subprocess.run(['osascript', '-e', applescript], check=True)
-                    self.progress.emit(int((i + 1) / total_files * 100))
-                except Exception as e:
-                    self.error.emit(f'处理文件 {filename} 时出错：{str(e)}')
-                    return
-            
-            # 完成后关闭Word
-            if self.word_app:
-                subprocess.run(['osascript', '-e', 'tell application "Microsoft Word" to quit'], check=True)
+                    while self.is_paused:
+                        time.sleep(0.1)
+                        if self.is_stopped:
+                            self.error.emit('转换已停止')
+                            return
+                            
+                    try:
+                        input_path = os.path.join(self.input_folder, filename)
+                        output_path = os.path.join(self.output_folder, 
+                                                 os.path.splitext(filename)[0] + '.pdf')
+                        
+                        if os.path.exists(output_path):
+                            action = self.handle_conflict(filename, output_path)
+                            
+                            if action is None:
+                                self.error.emit('转换已取消')
+                                return
+                            elif action == 'skip':
+                                continue
+                            elif action == 'new_version':
+                                base, ext = os.path.splitext(output_path)
+                                counter = 1
+                                while os.path.exists(f"{base}_{counter}{ext}"):
+                                    counter += 1
+                                output_path = f"{base}_{counter}{ext}"
+                        
+                        applescript = f'''
+                        tell application "Microsoft Word"
+                            set visible to false
+                            activate
+                            set the position of window 1 to {{-1000, -1000}}
+                            open "{input_path}"
+                            set activeDoc to active document
+                            save as activeDoc file name "{output_path}" file format format PDF
+                            close activeDoc saving no
+                        end tell
+                        '''
+                        
+                        converted_count += 1
+                        self.current_file.emit(f'已发现 {total_files} 个Word文件，已成功转换 {converted_count} 个')
+                        subprocess.run(['osascript', '-e', applescript], check=True)
+                        self.progress.emit(int((i + 1) / total_files * 100))
+                    except Exception as e:
+                        self.error.emit(f'处理文件 {filename} 时出错：{str(e)}')
+                        return
+            finally:
+                if self.word_app:
+                    try:
+                        subprocess.run(['osascript', '-e', 'tell application "Microsoft Word" to quit'], check=True)
+                    except:
+                        pass
+                    finally:
+                        self.word_app = None
             
             self.finished.emit()
         except Exception as e:
@@ -273,21 +314,80 @@ class Word2PDFApp(QMainWindow):
 
     def check_office_installation(self):
         try:
-            # 尝试运行权限授予脚本，但不显示对话框
+            # 检查 Microsoft Word 是否安装
+            word_check = subprocess.run(['osascript', '-e', 'tell application "Microsoft Word" to get version'], capture_output=True, text=True)
+            if word_check.returncode != 0:
+                QMessageBox.critical(self, '错误', 'Microsoft Word 未安装或无法访问。\n\n请确保已安装 Microsoft Word 并重新启动应用程序。')
+                sys.exit(1)
+
+            # 运行权限授予脚本
             grant_script = os.path.join(os.path.dirname(__file__), 'grant_access.scpt')
             if os.path.exists(grant_script):
+                # 检查系统事件权限
                 try:
-                    # 静默运行权限检查
                     subprocess.run(['osascript', '-e', 'tell application "System Events" to get name of application processes'], check=True)
                 except subprocess.CalledProcessError:
-                    print('警告：无法获取系统事件权限')
+                    subprocess.run(['osascript', grant_script], check=True)
+                    return
+
+                # 检查文件系统权限
+                test_dir = os.path.expanduser('~/Documents/Word2PDF_Test')
+                try:
+                    os.makedirs(test_dir, exist_ok=True)
+                    test_file = os.path.join(test_dir, 'test.txt')
+                    with open(test_file, 'w') as f:
+                        f.write('test')
+                    os.remove(test_file)
+                    os.rmdir(test_dir)
+                except (PermissionError, OSError):
+                    subprocess.run(['osascript', grant_script], check=True)
+                    return
+
         except Exception as e:
             QMessageBox.critical(
                 self,
                 '错误',
-                f'初始化程序时发生未知错误：{str(e)}\n\n程序将退出。'
+                f'初始化程序时发生错误：{str(e)}\n\n请确保已授予所有必要权限并重新启动应用程序。'
             )
             sys.exit(1)
+
+    def handle_file_conflict(self, filename, output_path, show_global_option=True):
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Question)
+        msg.setWindowTitle('文件已存在')
+        msg.setText(f'文件 "{filename}" 已存在于输出文件夹中。')
+        msg.setInformativeText('请选择如何处理此文件：')
+        
+        # 添加按钮
+        overwrite_button = msg.addButton('覆盖', QMessageBox.ButtonRole.AcceptRole)
+        skip_button = msg.addButton('跳过', QMessageBox.ButtonRole.RejectRole)
+        new_version_button = msg.addButton('创建新版本', QMessageBox.ButtonRole.ActionRole)
+        
+        # 添加全局选项复选框
+        if show_global_option:
+            global_checkbox = QCheckBox('对所有文件执行相同操作', msg)
+            msg.setCheckBox(global_checkbox)
+        
+        msg.exec()
+        
+        clicked_button = msg.clickedButton()
+        choice = None
+        
+        if clicked_button == overwrite_button:
+            choice = 'overwrite'
+        elif clicked_button == skip_button:
+            choice = 'skip'
+        elif clicked_button == new_version_button:
+            choice = 'new_version'
+            
+        # 如果用户选择了全局选项
+        if show_global_option and global_checkbox.isChecked():
+            self.convert_thread.global_conflict_choice = choice
+        
+        # 设置用户的响应
+        self.convert_thread.conflict_response = choice
+            
+        return choice
 
     def start_conversion(self):
         if not hasattr(self, 'input_folder') or not hasattr(self, 'output_folder'):
@@ -299,6 +399,7 @@ class Word2PDFApp(QMainWindow):
         self.convert_thread.current_file.connect(self.update_current_file)
         self.convert_thread.finished.connect(self.conversion_finished)
         self.convert_thread.error.connect(self.show_error)
+        self.convert_thread.conflict_signal.connect(self.handle_file_conflict)
         self.convert_thread.start()
         
         # 更新按钮状态
